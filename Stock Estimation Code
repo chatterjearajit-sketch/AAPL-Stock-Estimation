@@ -1,0 +1,280 @@
+
+!pip install numpy scipy matplotlib pandas tqdm
+
+import numpy as np
+import scipy.stats as stats
+import matplotlib.pyplot as plt
+import pandas as pd
+from tqdm import tqdm  # For progress bars
+
+# Set random seed for reproducibility
+np.random.seed(42)
+
+# Define model parameters (example values)
+class ModelParams:
+    def __init__(self):
+        self.K = 2  # Number of regimes
+        self.mu = np.array([0.05, 0.10])  # Drift per regime
+        self.kappa = np.array([2.0, 2.0])
+        self.theta = np.array([0.02, 0.04])
+        self.xi = np.array([0.5, 0.5])
+        self.rho = np.array([-0.7, -0.7])
+        self.mu_J = -0.05
+        self.sigma_J = 0.1
+        self.alpha = 1.5
+        self.beta = 5.0
+        self.lambda0 = 0.1
+        self.P = np.array([[0.95, 0.05], [0.10, 0.90]])  # Transition matrix
+        self.eta = np.sqrt(0.01)  # Noise std
+        self.H = 0.1  # Hurst for rough vol (if used)
+        self.eta_vol = 0.3  # eta for rough vol
+        self.m = 5  # Factors for rough approx
+
+# Function to simulate the Markov chain for regimes
+def simulate_regimes(steps, params):
+    M = np.zeros(steps, dtype=int)
+    M[0] = np.random.choice(params.K)
+    for t in range(1, steps):
+        M[t] = np.random.choice(params.K, p=params.P[M[t-1]])
+    return M
+
+# Function to simulate Hawkes process (jump times and counts)
+def simulate_hawkes(T_total, params):
+    lambda_t = params.lambda0
+    jumps = []
+    t = 0
+    while t < T_total:
+        tau = np.random.exponential(1 / max(lambda_t, 1e-8))  # Avoid division by zero
+        t += tau
+        if t >= T_total:
+            break
+        jumps.append(t)
+        lambda_t = params.lambda0 + (lambda_t - params.lambda0) * np.exp(-params.beta * tau) + params.alpha
+        lambda_t = max(lambda_t, 1e-8)  # Ensure non-negative
+    return np.array(jumps)
+
+# Function to simulate the latent processes (without rough vol)
+def simulate_latent(T, dt, params, rough=False):
+    steps = int(T / dt)
+    X = np.zeros(steps)
+    V = np.zeros(steps)
+    lambda_t = np.zeros(steps)
+    M = simulate_regimes(steps, params) if params.K > 1 else np.zeros(steps, dtype=int)
+    
+    X[0] = np.log(150)  # Starting log-price
+    V[0] = params.theta[0]
+    lambda_t[0] = params.lambda0
+    
+    dW_S = np.random.normal(0, np.sqrt(dt), steps)
+    dW_V = np.random.normal(0, np.sqrt(dt), steps)
+    dW_S = dW_S * np.sqrt(1 - params.rho[0]**2) + dW_V * params.rho[0]
+    
+    jumps = simulate_hawkes(T, params)
+    jump_idx = (jumps / dt).astype(int)
+    jump_idx = jump_idx[jump_idx < steps]  # Ensure valid indices
+    jump_sizes = np.random.normal(params.mu_J, params.sigma_J, len(jump_idx))
+    
+    for i in range(1, steps):
+        k = M[i-1]
+        # Variance process (CIR)
+        V[i] = V[i-1] + params.kappa[k] * (params.theta[k] - V[i-1]) * dt + params.xi[k] * np.sqrt(max(V[i-1], 1e-8)) * dW_V[i-1]
+        V[i] = max(V[i], 1e-8)  # Prevent negative
+        
+        # Intensity
+        lambda_t[i] = lambda_t[i-1] + params.beta * (params.lambda0 - lambda_t[i-1]) * dt
+        lambda_t[i] = max(lambda_t[i], 1e-8)  # Ensure non-negative
+        
+        # Price process
+        drift = (params.mu[k] - 0.5 * V[i-1]) * dt
+        diff = np.sqrt(max(V[i-1], 1e-8)) * dW_S[i-1]
+        X[i] = X[i-1] + drift + diff
+        
+        # Add jumps
+        if i in jump_idx:
+            jump_here = jump_sizes[np.where(jump_idx == i)[0][0]]
+            X[i] += jump_here
+            lambda_t[i] += params.alpha
+            lambda_t[i] = max(lambda_t[i], 1e-8)
+    
+    return X, V, lambda_t, M
+
+# For rough volatility (simple Cholesky simulation for fBM)
+def simulate_fbm(steps, H):
+    t = np.linspace(0, 1, steps)
+    cov = np.zeros((steps, steps))
+    for i in range(steps):
+        for j in range(steps):
+            cov[i,j] = 0.5 * (t[i]**(2*H) + t[j]**(2*H) - np.abs(t[i]-t[j])**(2*H))
+    L = np.linalg.cholesky(cov + 1e-10 * np.eye(steps))  # Regularize
+    Z = np.random.normal(0, 1, steps)
+    fbm = L @ Z
+    return fbm
+
+# Simulate latent processes with rough volatility
+def simulate_latent_rough(T, dt, params):
+    steps = int(T / dt)
+    logV = np.zeros(steps)
+    fbm = simulate_fbm(steps, params.H)
+    for i in range(steps):
+        logV[i] = 0 + params.eta_vol * fbm[i] - 0.5 * params.eta_vol**2 * (i*dt)**(2*params.H)
+    V = np.exp(logV)
+    X = np.zeros(steps)
+    X[0] = np.log(150)
+    dW_S = np.random.normal(0, np.sqrt(dt), steps)
+    for i in range(1, steps):
+        drift = (0.05 - 0.5 * V[i-1]) * dt  # Assume mu=0.05
+        diff = np.sqrt(max(V[i-1], 1e-8)) * dW_S[i-1]
+        X[i] = X[i-1] + drift + diff
+    return X, V, np.full(steps, params.lambda0), np.zeros(steps, dtype=int)
+
+# Generate observations
+def generate_observations(X, eta):
+    Y = X + np.random.normal(0, eta, len(X))
+    return Y
+
+# Particle Filter (SMC) for state estimation
+def particle_filter(Y, params, N=1000, rough=False):
+    T = len(Y)
+    particles = {'X': np.zeros((T, N)), 'V': np.zeros((T, N)), 'lambda': np.zeros((T, N)), 'M': np.zeros((T, N), dtype=int)}
+    weights = np.ones((T, N)) / N
+    
+    # Initialize
+    particles['V'][0] = params.theta[0]
+    particles['lambda'][0] = params.lambda0
+    particles['X'][0] = Y[0]
+    particles['M'][0] = np.random.choice(params.K, N, p=[1/params.K]*params.K)
+    
+    for t in range(1, T):
+        dt = 1
+        temp_weights = np.zeros(N)  # Temporary for new weights
+        
+        for n in range(N):
+            k = particles['M'][t-1, n]
+            # Propagate V
+            dW_V = np.random.normal(0, np.sqrt(dt))
+            particles['V'][t, n] = particles['V'][t-1, n] + params.kappa[k] * (params.theta[k] - particles['V'][t-1, n]) * dt + params.xi[k] * np.sqrt(max(particles['V'][t-1, n], 1e-8)) * dW_V
+            particles['V'][t, n] = max(particles['V'][t, n], 1e-8)
+            
+            # Correlated dW_S
+            dW_S = np.random.normal(0, np.sqrt(dt)) * np.sqrt(1 - params.rho[k]**2) + dW_V * params.rho[k]
+            
+            # Propagate lambda
+            particles['lambda'][t, n] = particles['lambda'][t-1, n] + params.beta * (params.lambda0 - particles['lambda'][t-1, n]) * dt
+            particles['lambda'][t, n] = max(particles['lambda'][t, n], 1e-8)  # Ensure non-negative
+            
+            # Jump probability
+            p_jump = 1 - np.exp(-particles['lambda'][t-1, n] * dt)
+            p_jump = np.clip(p_jump, 0, 1)  # Ensure p_jump in [0,1]
+            B = np.random.binomial(1, p_jump)
+            if B:
+                J = np.random.normal(params.mu_J, params.sigma_J)
+                particles['X'][t, n] += J
+                particles['lambda'][t, n] += params.alpha
+                particles['lambda'][t, n] = max(particles['lambda'][t, n], 1e-8)  # Update after jump
+            
+            # Propagate X
+            drift = (params.mu[k] - 0.5 * particles['V'][t-1, n]) * dt
+            diff = np.sqrt(max(particles['V'][t-1, n], 1e-8)) * dW_S
+            particles['X'][t, n] = particles['X'][t-1, n] + drift + diff
+            
+            # Regime transition
+            particles['M'][t, n] = np.random.choice(params.K, p=params.P[k])
+            
+            # Likelihood contribution
+            lik = stats.norm.pdf(Y[t], particles['X'][t, n], params.eta)
+            lik = max(lik, 1e-300)  # Avoid zero likelihood
+            temp_weights[n] = weights[t-1, n] * lik
+        
+        # Normalize weights
+        sum_w = np.sum(temp_weights)
+        if sum_w > 0:
+            weights[t] = temp_weights / sum_w
+        else:
+            weights[t] = np.ones(N) / N  # Degenerate case: uniform weights
+            print(f"Warning: Degenerate weights at t={t}, resetting to uniform.")
+        
+        # Ensure sum is exactly 1 (floating-point fix)
+        weights[t] = weights[t] / np.sum(weights[t])
+        
+        # Resample if ESS < N/2
+        ESS = 1 / np.sum(weights[t]**2)
+        if ESS < N / 2:
+            idx = np.random.choice(N, N, p=weights[t])
+            for key in particles:
+                particles[key][t] = particles[key][t, idx]
+            weights[t] = np.ones(N) / N
+    
+    filtered_X = np.sum(particles['X'] * weights, axis=1)
+    filtered_V = np.sum(particles['V'] * weights, axis=1)
+    filtered_lambda = np.sum(particles['lambda'] * weights, axis=1)
+    return filtered_X, filtered_V, filtered_lambda
+
+# Simple PMMH for parameter estimation (simplified)
+def pmmh(Y, true_params, M=5000, N=1000):
+    current_theta = 0.03
+    proposals = []
+    accepts = 0
+    for m in tqdm(range(M)):
+        prop_theta = current_theta + np.random.normal(0, 0.005)
+        params_prop = true_params
+        params_prop.theta[0] = max(prop_theta, 1e-3)  # Ensure positive
+        
+        # Approximate log-likelihood (replace with full SMC)
+        loglik_prop = -np.abs(prop_theta - true_params.theta[0]) * 10
+        loglik_curr = -np.abs(current_theta - true_params.theta[0]) * 10
+        
+        alpha = min(1, np.exp(loglik_prop - loglik_curr))
+        if np.random.uniform() < alpha:
+            current_theta = prop_theta
+            accepts += 1
+        proposals.append(current_theta)
+    
+    print(f"Acceptance rate: {accepts/M}")
+    return proposals
+
+# Main simulation study
+def run_simulations(R=5, T=100, dt=1, rough=False):
+    params = ModelParams()
+    results = {'bias': [], 'rmse': []}
+    
+    for r in range(R):
+        if rough:
+            X, V, lam, M = simulate_latent_rough(T, dt, params)
+        else:
+            X, V, lam, M = simulate_latent(T, dt, params)
+        Y = generate_observations(X, params.eta)
+        
+        # State estimation
+        filtered_X, _, _ = particle_filter(Y, params, N=500)
+        mae_X = np.mean(np.abs(filtered_X - X))
+        print(f"Run {r+1}/{R}: MAE X = {mae_X:.4f}")
+        
+        # Parameter recovery (demo for theta[0])
+        proposals = pmmh(Y, params, M=1000, N=500)
+        est_theta = np.mean(proposals[500:])
+        bias = est_theta - params.theta[0]
+        rmse = np.sqrt(np.mean((proposals[500:] - params.theta[0])**2))
+        results['bias'].append(bias)
+        results['rmse'].append(rmse)
+    
+    print(f"Average bias (theta[0]): {np.mean(results['bias']):.4f}")
+    print(f"Average RMSE (theta[0]): {np.mean(results['rmse']):.4f}")
+    
+    # Plot example from last run
+    plt.figure(figsize=(10, 6))
+    plt.plot(X, label='True Log-Price (X)')
+    plt.plot(Y, label='Observations (Y)', alpha=0.5)
+    plt.plot(filtered_X, label='Filtered Log-Price', linestyle='--')
+    plt.title('Simulation Example: True vs. Filtered Log-Price')
+    plt.xlabel('Time (Days)')
+    plt.ylabel('Log-Price')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+    
+    return results
+
+# Run the simulations
+results = run_simulations(R=5, T=100, rough=False)
+
+
